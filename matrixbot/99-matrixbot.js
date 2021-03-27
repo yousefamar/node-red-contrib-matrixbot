@@ -1,8 +1,15 @@
+"use strict";
+
+
+global.crypto = require('crypto').webcrypto;
+global.Olm = require("olm");
+const sdk = require("matrix-js-sdk");
+const { LocalStorage } = require('node-localstorage');
+const { LocalStorageCryptoStore } = require('matrix-js-sdk/lib/crypto/store/localStorage-crypto-store');
+//const { decryptMegolmKeyFile } = require('./megolm-utils.js');
+const crypto = require('crypto');
+
 module.exports = function(RED) {
-
-	"use strict";
-
-	var sdk = require("matrix-js-sdk");
 
 // --------------------------------------------------------------------------------------------
 	// The configuration node holds the configuration and credentials for all nodes.
@@ -10,99 +17,178 @@ module.exports = function(RED) {
 	function MatrixBotNode(config) {
 		RED.nodes.createNode(this, config);
 
-		// copy "this" object in case we need it in context of callbacks of other functions.
-		var node = this;
+		// This is a constructor and cannot be async, so wrap in an async IIFE
+		(async () => {
+			// copy "this" object in case we need it in context of callbacks of other functions.
+			var node = this;
 
-		node.log("Initializing Matrix Bot node");
+			node.log("Initializing Matrix Bot node");
 
-		// Configuration options passed by Node Red
-		node.userId = config.userId;
-		node.room = config.room;
+			// Configuration options passed by Node Red
+			node.userId = config.userId;
+			node.accessToken = config.accessToken;
+			node.room = config.room;
+			node.keys = config.keys;
+			node.passphrase = config.passphrase;
+			node.e2ee = node.keys && node.passphrase;
+			node.deviceId = config.deviceId;
 
-		// TODO: Switch from configuration to credentials and check with if (this.credentials)
-		node.accessToken = config.accessToken;
-		node.matrixServerURL = config.matrixServerURL;
+			// TODO: Switch from configuration to credentials and check with if (this.credentials)
+			node.matrixServerURL = config.matrixServerURL;
 
-		node.matrixClient = sdk.createClient({
-			baseUrl: node.matrixServerURL,
-			accessToken: node.accessToken,
-			userId: node.userId
-		});
+			const localStorage = new LocalStorage('./store-' + crypto.createHash('md5').update(node.userId, 'utf8').digest('hex'));
 
-		// If no room is specified, join any room where we are invited
-		if (!node.room || node.room === "") {
-			node.matrixClient.on("RoomMember.membership", function(event, member) {
-				if (member.membership === "invite" && member.userId === node.userId) {
-					node.log("Trying to join room " + member.roomId);
-					node.matrixClient.joinRoom(member.roomId).then(function() {
-						node.log("Automatically accepted invitation to join room " + member.roomId);
-					}).catch(function(e) {
-						node.warn("Cannot join room (probably because I was kicked) " + member.roomId + ": " + e);
-					});
+			let keys;
+
+			node.matrixClient = sdk.createClient({
+				baseUrl: node.matrixServerURL,
+				accessToken: node.accessToken,
+				userId: node.userId,
+				deviceId: node.deviceId,
+				sessionStore: new sdk.WebStorageSessionStore(localStorage),
+				cryptoStore: new LocalStorageCryptoStore(localStorage),
+				cryptoCallbacks: {
+					saveCrossSigningKeys: k => keys = k,
+					getCrossSigningKey: typ => keys[typ],
+					getSecretStorageKey: async request => {
+						console.log('aaaaaaaaaaa', node.privateKey, keys);
+						return [ Object.keys(request.keys)[0], node.privateKey ];
+					},
+				},
+			});
+
+			//const res = await node.matrixClient.login('m.login.password', { user: node.userId, password: node.passphrase, initial_device_display_name: 'Node-RED' });
+
+			//node.log(JSON.stringify(res));
+
+			//node.matrixClient.deviceId = res.device_id;
+
+
+			// If no room is specified, join any room where we are invited
+			if (!node.room || node.room === "") {
+				node.matrixClient.on("RoomMember.membership", function(event, member) {
+					if (member.membership === "invite" && member.userId === node.userId) {
+						node.log("Trying to join room " + member.roomId);
+						node.matrixClient.joinRoom(member.roomId).then(function() {
+							node.log("Automatically accepted invitation to join room " + member.roomId);
+						}).catch(function(e) {
+							node.warn("Cannot join room (probably because I was kicked) " + member.roomId + ": " + e);
+						});
+					}
+				});
+			}
+
+			node.matrixClient.onDecryptedMessage = message => {
+				console.log('Got encrypted message: ', message);
+			}
+
+			node.matrixClient.on('Event.decrypted', (event) => {
+				if (event.getType() === 'm.room.message'){
+					node.matrixClient.onDecryptedMessage(event.getContent().body);
+				} else {
+					console.log('decrypted an event of type', event.getType());
+					console.log(event);
 				}
 			});
-		}
 
-		node.matrixClient.on("sync", function(state, prevState, data) {
-			switch (state) {
-		    case "ERROR":
-		      // update UI to say "Connection Lost"
-		      node.warn("Connection to Matrix server lost");
-		      node.updateConnectionState(false);
-		      break;
-		    case "SYNCING":
-		      // update UI to remove any "Connection Lost" message
-		      node.updateConnectionState(true);
-		      break;
-		    case "PREPARED":
-		      	// the client instance is ready to be queried.
-   		      	node.log("Synchronized to Matrix server.");
+			node.matrixClient.on("sync", function(state, prevState, data) {
+				switch (state) {
+					case "ERROR":
+						// update UI to say "Connection Lost"
+						node.warn("Connection to Matrix server lost");
+						node.updateConnectionState(false);
+						break;
+					case "SYNCING":
+						// update UI to remove any "Connection Lost" message
+						node.updateConnectionState(true);
+						break;
+					case "PREPARED":
+						// the client instance is ready to be queried.
+						node.log("Synchronized to Matrix server.");
 
-   		      	if (node.room) {
-	   		      	node.log("Trying to join room " + node.room);
+						if (node.room) {
+							node.log("Trying to join room " + node.room);
 
-					node.matrixClient.joinRoom(node.room, {syncRoom:false})
-						.then(function(joinedRoom) {
-							node.log("Joined " + node.room);
-							node.room = joinedRoom.roomId;
-							node.updateConnectionState(true);
-						}).catch(function(e) {
-							node.warn("Error joining " + node.room + ": " + e);
-						});
-				} else {
-					node.log("No room configured. Will only join rooms where I'm invited");
+							node.matrixClient.joinRoom(node.room, {syncRoom:false})
+								.then(function(joinedRoom) {
+									node.log("Joined " + node.room);
+									node.room = joinedRoom.roomId;
+									node.updateConnectionState(true);
+								}).catch(function(e) {
+									node.warn("Error joining " + node.room + ": " + e);
+								});
+						} else {
+							node.log("No room configured. Will only join rooms where I'm invited");
+						}
+						break;
 				}
-		      	break;
-		  	}
-		});
+			});
 
-		node.log("Connecting to Matrix server...");
+			node.log("Connecting to Matrix server...");
 
-		node.matrixClient.startClient();
+			if (node.e2ee) {
+				await node.matrixClient.initCrypto();
+				try {
+					let aa;
+					//const { backupInfo } = aa = await node.matrixClient.checkKeyBackup();
+					const backupInfo = await node.matrixClient.getKeyBackupVersion();
+					const has4S = await node.matrixClient.hasSecretStorageKey();
+					const backupKeyStored = has4S && await node.matrixClient.isKeyBackupKeyStored();
 
-        // Called when the connection state may have changed
-        this.updateConnectionState = function(connected){
-        	if (node.connected !== connected) {
-        		node.connected = connected;
-	        	if (connected) {
-	        		node.emit("connected");
-	        	} else {
-	        		node.emit("disconnected");
-	        	}
-	        }
-        };
+					const backupHasPassphrase = (
+						backupInfo &&
+						backupInfo.auth_data &&
+						backupInfo.auth_data.private_key_salt &&
+						backupInfo.auth_data.private_key_iterations
+					);
 
-        // When Node-RED updates nodes, disconnect from server to ensure a clean start
-		node.on("close", function (done) {
-			node.log("Matrix configuration node closing...");
-			if (node.matrixClient) {
-        		node.log("Disconnecting from Matrix server...");
-        		node.matrixClient.stopClient();
-        		node.updateConnectionState(false);
-        	}
-			done();
-		});
+					node.log('################');
+					console.log(backupHasPassphrase, backupInfo);
+					if (backupInfo) {
+						// A complete restore can take many minutes for large
+						// accounts / slow servers, so we allow the dialog
+						// to advance before this.
+						//const recoverInfo = await node.matrixClient.restoreKeyBackupWithPassword(node.passphrase, undefined, undefined, backupInfo);
+						const recoverInfo = await node.matrixClient.restoreKeyBackupWithSecretStorage(backupInfo);
+						console.log(recoverInfo);
+					}
+				} catch (e) {
+					node.log('xxxxxxxxxxxxxxxxx');
+					console.error(e);
 
+				}
+			}
+
+			await node.matrixClient.startClient({ initialSyncLimit: 1 });
+			//await node.matrixClient.startClient();
+
+			// Called when the connection state may have changed
+			this.updateConnectionState = function(connected){
+				if (node.connected !== connected) {
+					node.connected = connected;
+					if (connected) {
+						node.emit("connected", node.e2ee);
+					} else {
+						node.emit("disconnected");
+					}
+				}
+			};
+
+			// When Node-RED updates nodes, disconnect from server to ensure a clean start
+			node.on("close", function (done) {
+				node.log("Matrix configuration node closing...");
+				if (node.matrixClient) {
+					node.log("Disconnecting from Matrix server...");
+					//node.matrixClient.logout().then(() => {
+						node.matrixClient.stopClient();
+						node.updateConnectionState(false);
+					//}).catch(done);
+				} else {
+					done();
+				}
+			});
+
+		})();
 	}
 
 	RED.nodes.registerType("matrix bot", MatrixBotNode);
@@ -119,11 +205,11 @@ module.exports = function(RED) {
         // Configuration options passed by Node Red
         node.configNode = RED.nodes.getNode(config.bot);
 
-        node.configNode.on("connected", function(){
-        	node.status({ fill: "green", shape: "ring", text: "connected" });
+        node.configNode.on("connected", function(e2ee){
+        	node.status({ fill: "green", shape: "ring", text: "connected" + (e2ee ? ' (E2EE)' : '') });
         });
 
-        node.configNode.on("disconnected", function(){
+        node.configNode.on("disconnected", function(e2ee){
         	node.status({ fill: "red", shape: "ring", text: "disconnected" });
         });
 
@@ -202,8 +288,8 @@ module.exports = function(RED) {
         	node.status({ fill: "red", shape: "ring", text: "disconnected" });
         });
 
-		node.configNode.on("connected", function() {
-			node.status({ fill: "green", shape: "ring", text: "connected" });
+		node.configNode.on("connected", function(e2ee) {
+			node.status({ fill: "green", shape: "ring", text: "connected" + (e2ee ? ' (E2EE)' : '')});
 			node.configNode.matrixClient.on("Room.timeline", function(event, room, toStartOfTimeline, data) {
 				if (toStartOfTimeline) {
 					return; // don't print paginated results
@@ -264,8 +350,8 @@ module.exports = function(RED) {
         	node.status({ fill: "red", shape: "ring", text: "disconnected" });
         });
 
-		node.configNode.on("connected", function() {
-			node.status({ fill: "green", shape: "ring", text: "connected" });
+		node.configNode.on("connected", function(e2ee) {
+			node.status({ fill: "green", shape: "ring", text: "connected" + (e2ee ? ' (E2EE)' : '') });
 			node.configNode.matrixClient.on("Room.timeline", function(event, room, toStartOfTimeline, data) {
 				if (toStartOfTimeline) {
 					return; // don't print paginated results

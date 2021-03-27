@@ -3,7 +3,9 @@
   "version": "0.0.2",
   "description": "Matrix bot nodes for Node-RED",
   "dependencies": {
-    "matrix-js-sdk": "^9.3.0"
+    "matrix-js-sdk": "^9.6.0",
+    "node-localstorage": "^2.1.6",
+    "olm": "https://packages.matrix.org/npm/olm/olm-3.2.1.tgz"
   },
   "node-red": {
     "nodes": {
